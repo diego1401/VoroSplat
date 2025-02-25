@@ -241,6 +241,9 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     )
 
                 if iters_since_update >= triangulation_update_period:
+                    model.apply_centroidal_voronoi_tessellation()
+
+                if iters_since_update >= triangulation_update_period:
                     model.update_triangulation(incremental=True)
                     iters_since_update = 0
 

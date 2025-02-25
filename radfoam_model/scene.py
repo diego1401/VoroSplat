@@ -63,6 +63,7 @@ class RadFoamScene(torch.nn.Module):
             torch.randn(self.num_init_points, 3, device=self.device) * 25
         )
         self.triangulation = radfoam.Triangulation(primal_points)
+
         perm = self.triangulation.permutation().to(torch.long)
         primal_points = primal_points[perm]
 
@@ -156,6 +157,17 @@ class RadFoamScene(torch.nn.Module):
         self.density = optimizable_tensors["density"]
         self.att_dc = optimizable_tensors["att_dc"]
         self.att_sh = optimizable_tensors["att_sh"]
+
+    def apply_centroidal_voronoi_tessellation(self,num_lloyd_iterations=10):
+        if not self.primal_points.isfinite().all():
+            raise RuntimeError("NaN in points")
+        points = self.primal_points
+        point_adjacency = self.point_adjacency
+        point_adjacency_offsets = self.point_adjacency_offsets
+        
+        new_centroids = radfoam.centroidal_voronoi_tessellation_single_iteration(points, point_adjacency, point_adjacency_offsets)
+
+        self.primal_points.copy_(new_centroids)
 
     def update_triangulation(self, rebuild=True, incremental=False):
         if not self.primal_points.isfinite().all():

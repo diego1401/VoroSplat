@@ -5,6 +5,9 @@
 
 namespace radfoam {
 
+// bool INTERSECT_BACK_FACES = false;
+// TODO: Not sure that intersect_back_faces work correctly since we did not change the backprop in cell_intersection_grad
+
 template <int block_size, int chunk_size, typename CellFunctor>
 __forceinline__ __device__ uint32_t
 trace(const Ray &ray,
@@ -57,6 +60,9 @@ trace(const Ray &ray,
                 Vec3f face_origin = primal_point + offset / 2.0f;
                 Vec3f face_normal = offset;
                 float dp = face_normal.dot(ray.direction);
+                if (false){
+                    dp = fabs(dp);
+                }
                 float t = (face_origin - ray.origin).dot(face_normal) / dp;
 
                 if (dp > 0.0f && t < t_1 && (i + j) < num_faces) {

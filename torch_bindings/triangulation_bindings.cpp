@@ -5,6 +5,7 @@
 #include "aabb_tree/aabb_tree.h"
 #include "delaunay/delaunay.h"
 #include "delaunay/triangulation_ops.h"
+#include "voronoi_utils/centroidal_voronoi_tessellation.h"
 
 namespace radfoam_bindings {
 
@@ -139,6 +140,34 @@ torch::Tensor build_aabb_tree(torch::Tensor points) {
     return aabb_tree;
 }
 
+torch::Tensor 
+centroidal_voronoi_tessellation_single_iteration(torch::Tensor points_in,
+                             torch::Tensor point_adjacency_in,
+                             torch::Tensor point_adjacency_offsets_in){
+
+    uint32_t num_points = points_in.size(0);
+    torch::Tensor points = points_in.contiguous();
+    torch::Tensor point_adjacency = point_adjacency_in.contiguous();
+    torch::Tensor point_adjacency_offsets =
+        point_adjacency_offsets_in.contiguous();
+
+    if (points.device().type() != at::kCUDA) {
+        throw std::runtime_error("points must be on CUDA device");
+    }
+
+    torch::Tensor updated_centroids = torch::empty({num_points,3},
+        torch::TensorOptions().dtype(points_in.dtype()).device(points_in.device()));
+
+    radfoam::centroidal_voronoi_tessellation_single_iteration(dtype_to_scalar_type(points.scalar_type()),
+                                             points.data_ptr(),
+                                             point_adjacency.data_ptr(),
+                                             point_adjacency_offsets.data_ptr(),
+                                             num_points,
+                                             static_cast<float *>(updated_centroids.data_ptr()));
+
+    return updated_centroids;
+}
+
 torch::Tensor
 nn(torch::Tensor points, torch::Tensor tree, torch::Tensor queries) {
     uint32_t num_points = points.numel() / 3;
@@ -237,6 +266,12 @@ void init_triangulation_bindings(py::module &module) {
         .def("permutation", &permutation);
 
     module.def("build_aabb_tree", &build_aabb_tree, py::arg("points"));
+
+    module.def("centroidal_voronoi_tessellation_single_iteration",
+        &centroidal_voronoi_tessellation_single_iteration,
+        py::arg("points"),
+        py::arg("point_adjacency"),
+        py::arg("point_adjacency_offsets"));
 
     module.def(
         "nn", &nn, py::arg("points"), py::arg("tree"), py::arg("queries"));

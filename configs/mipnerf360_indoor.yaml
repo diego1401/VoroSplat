@@ -24,10 +24,11 @@ attributes_lr_init: 5e-3
 attributes_lr_final: 5e-4
 sh_factor: 0.1
 freeze_points: 18_000                  # Points are frozen after this cycle
+centroidal_voronoi_iterations: [1, 1000,5000,10000]
 
 # Dataset Parameters
 dataset: "colmap"
-data_path: "data/mipnerf360"
+data_path: "../../data/mipnerf360"
 scene: "bonsai"
 patch_based: false
 downsample: [4, 2]                     # Image downsample factors

@@ -75,6 +75,7 @@ class OptimizationParams(ParamGroup):
         self.attributes_lr_final = 5e-4
         self.sh_factor = 0.1
         self.freeze_points = 18_000
+        self.centroidal_voronoi_iterations = [1000,5000,10000]
         super().__init__(parser, "Setting Optimization parameters")
 
 

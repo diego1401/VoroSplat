@@ -20,7 +20,9 @@ list(
   delaunay/growth_iteration.cu
   delaunay/delete_violations.cu
   delaunay/triangulation_ops.cu
-  tracing/pipeline.cu)
+  tracing/pipeline.cu
+  voronoi_utils/centroidal_voronoi_tessellation.cu
+  )
 
 add_library(radfoam STATIC ${RADFOAM_CXX_SOURCES} ${RADFOAM_CUDA_SOURCES})
 target_include_directories(radfoam PUBLIC ${RADFOAM_INCLUDES})
