@@ -338,4 +338,4 @@ def marching_tetraheadra(tet_adjacency, primal_values, points):
     new_points, new_tri = triangle_case2(tet_adjacency[pos==2], values[pos==2], points)
     new_v.append(new_points)
     new_f.append(cur_ind+new_tri)
-    return torch.cat(new_v).cpu().detach().numpy(), torch.cat(new_f).cpu().detach().numpy()
+    return torch.cat(new_v), torch.cat(new_f)
