@@ -11,12 +11,12 @@ from pytorch3d.renderer import (
 from pytorch3d.renderer import look_at_view_transform
 def triangle_case1(tets, values, points, features, alpha_f):
     '''one vertex is marked inside (resp. outside), three are outside (resp. inside).'''
-    ins = tets[values<0].repeat_interleave(3)
-    out = tets[values>=0]
+    ins = tets[values<=0].repeat_interleave(3)
+    out = tets[values>0]
     
     # interpolate point position
-    v_ins = values[values<0].repeat_interleave(3)
-    v_out = values[values>=0]
+    v_ins = values[values<=0].repeat_interleave(3)
+    v_out = values[values>0]
     alpha_value = (v_out/(v_out-v_ins))[:, None]
     new_points = alpha_value*points[ins] + (1-alpha_value)*points[out]
     
@@ -29,12 +29,12 @@ def triangle_case1(tets, values, points, features, alpha_f):
 
 def triangle_case2(tets, values, points, features, alpha_f):
     '''two vertices are marked inside, two are marked outside'''
-    ins = tets[values<0]
-    out = tets[values>=0]
+    ins = tets[values<=0]
+    out = tets[values>0]
     
     # interpolate point position
-    v_ins = values[values<0]
-    v_out = values[values>=0]
+    v_ins = values[values<=0]
+    v_out = values[values>0]
     
     a1 = (v_out[::2, None]/(v_out[::2, None]-v_ins[::2, None]))
     p1 = a1*points[ins][::2] + (1-a1)*points[out][::2]
