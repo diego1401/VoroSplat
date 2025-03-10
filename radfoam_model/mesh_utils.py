@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
+import torchvision
 
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
@@ -136,7 +137,8 @@ def get_camera_parameters_from_data_handler(datahandler,idx,device):
 
     return ground_truth_image,rotation, translation, height, width, fx, fy, cx, cy
 
-def render_mesh(v,f,feat,datahandler,idx=0):
+
+def render_mesh(v,f,feat,data_handler,size=(64,64),idx=0):
     '''
     Render the mesh given extracted vertices v and faces f. 
     This function outputs an image
@@ -151,9 +153,8 @@ def render_mesh(v,f,feat,datahandler,idx=0):
     mesh = Meshes(verts=verts, faces=faces, textures=textures)
 
     # Get the camera parameters
-    ground_truth_image, rotation, translation, height, width, fx, fy, cx, cy \
-        = get_camera_parameters_from_data_handler(datahandler,idx,device)
-    
+    # ground_truth_image, rotation, translation, height, width, fx, fy, cx, cy = get_camera_parameters(idx)
+    ground_truth_image, rotation, translation, height, width, fx, fy, cx, cy = get_camera_parameters_from_data_handler(data_handler,idx,device)
     rotation, translation = colmap_to_pytorch3d(rotation,translation,device)
 
     cameras = PerspectiveCameras(device=device, 
@@ -167,10 +168,12 @@ def render_mesh(v,f,feat,datahandler,idx=0):
     lights = PointLights(device=device, location=[[0.0, 0.0, 0.0]],ambient_color=((1.0,1.0,1.0),))
 
     # Rasterization settings
+    
+    new_h,new_w = size
     raster_settings = RasterizationSettings(
-        image_size=(height,width),
+        image_size=(new_h,new_w),
         blur_radius=0.0,
-        faces_per_pixel=10
+        faces_per_pixel=1
     )
 
     # Define rasterizer
@@ -183,7 +186,11 @@ def render_mesh(v,f,feat,datahandler,idx=0):
     renderer = MeshRenderer(rasterizer=rasterizer, shader=shader)
 
     # Render the image
-    return ground_truth_image,renderer(mesh).squeeze(0)
+    square_side = min(height,width)
+    reshape_gt = torchvision.transforms.CenterCrop((square_side,square_side))(ground_truth_image.permute(2,0,1))
+    reshape_gt = torchvision.transforms.Resize((new_h,new_w))(reshape_gt).permute(1,2,0)
+    
+    return reshape_gt,renderer(mesh)
 
 def mesh_render_plot(image,ground_truth_image,filename):
     # Convert prediction image from RGBA to RGB
