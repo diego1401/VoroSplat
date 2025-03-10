@@ -8,6 +8,7 @@ import tqdm
 import radfoam
 from radfoam_model.render import TraceRays
 from radfoam_model.utils import *
+from radfoam_model.mesh_utils import marching_tetrahedra
 
 
 class RadFoamScene(torch.nn.Module):
@@ -666,3 +667,23 @@ class RadFoamScene(torch.nn.Module):
         ).to(torch.uint32)
 
         self.aabb_tree = radfoam.build_aabb_tree(self.primal_points)
+
+    def get_mesh(self):
+        primal_values = (self.get_primal_density().squeeze() - 5)
+        ## Get the colors
+        color_attributes = self.get_primal_attributes()
+
+        C0 = 0.28209479177387814
+        r = 0.5 + C0 * color_attributes[:, 0]
+        g = 0.5 + C0 * color_attributes[:, 1]
+        b = 0.5 + C0 * color_attributes[:, 2]
+
+        primal_features = torch.stack([r, g, b], axis=1).float()
+
+
+        v, f, feat = marching_tetrahedra(self.triangulation.tets().long(),
+                                         primal_values,
+                                         self.primal_points,
+                                         primal_features)
+        
+        return v, f, feat
