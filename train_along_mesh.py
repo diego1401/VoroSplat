@@ -217,11 +217,14 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 loss = color_loss.mean() + \
                     opacity_loss + w_depth * quant_loss
                 # Mesh loss
-                try:
+                primal_values = (model.get_primal_density().squeeze() - 5)
+                if primal_values.max() > 0.0:
+                # try:
                     v, f, feat = model.get_mesh()
                     random_training_index = np.random.randint(0,train_data_handler.c2ws.shape[0])
                     gt_image_mesh, rgb_mesh = render_mesh(v,f,feat,
                                                           train_data_handler,
+                                                          size=(512,512),
                                                           idx=random_training_index)
                     # White background
                     mesh_opacity = rgb_mesh[..., -1:]
@@ -230,21 +233,21 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     else:
                         rgb_mesh_output = rgb_mesh[..., :3]
 
-                    print(f"RGB Mesh Output Shape: {rgb_mesh_output.shape}")
-                    print(f"RGB Mesh Output: {rgb_mesh_output}")
-                    print(f"Ground Truth Image Mesh Shape: {gt_image_mesh.shape}")
-                    print(f"Ground Truth Image Mesh: {gt_image_mesh}")
+                    # print(f"RGB Mesh Output Shape: {rgb_mesh_output.shape}")
+                    # print(f"RGB Mesh Output: {rgb_mesh_output}")
+                    # print(f"Ground Truth Image Mesh Shape: {gt_image_mesh.shape}")
+                    # print(f"Ground Truth Image Mesh: {gt_image_mesh}")
                     mesh_color_loss = rgb_loss(gt_image_mesh.cuda(),rgb_mesh_output)
-                    print('mesh color loss shape',mesh_color_loss.shape)
-                    print('mesh color loss',mesh_color_loss)
-                    print(f"Mesh color loss: {mesh_color_loss.mean().item():.5f}")
-                    print(f"Color loss min: {color_loss.min().item():.5f}, max: {color_loss.max().item():.5f}")
-                    print(f"Mesh color loss min: {mesh_color_loss.min().item():.5f}, max: {mesh_color_loss.max().item():.5f}")
-                    mesh_color_loss.register_full_backward_hook(nan_grad_hook)
+                    # print('mesh color loss shape',mesh_color_loss.shape)
+                    # print('mesh color loss',mesh_color_loss)
+                    # print(f"Mesh color loss: {mesh_color_loss.mean().item():.5f}")
+                    # print(f"Color loss min: {color_loss.min().item():.5f}, max: {color_loss.max().item():.5f}")
+                    # print(f"Mesh color loss min: {mesh_color_loss.min().item():.5f}, max: {mesh_color_loss.max().item():.5f}")
+                    # mesh_color_loss.register_full_backward_hook(nan_grad_hook)
                     mesh_color_report = mesh_color_loss.mean()
-                    # loss += mesh_color_loss.mean()
-                except:
-                    primal_values = (model.get_primal_density().squeeze() - 5)
+                    loss += mesh_color_loss.mean()
+                # except:
+                else:
                     print(f"Max primal value: {primal_values.max().item()}")
                     mesh_color_report = torch.inf
                 ###############
@@ -292,7 +295,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 if i % 10 == 9:
                     # Render test image example and save it
                     with torch.no_grad():
-                        try:
+                        if primal_values.max() > 0.0:
                             primal_values = (model.get_primal_density().squeeze() - 5)
                             if primal_values.max() > 0:
                                 v, f, feat = model.get_mesh()
@@ -300,8 +303,6 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                                                                 train_data_handler,
                                                                 idx=0)
                                 mesh_render_plot(rgb_mesh,gt_image_mesh,filename=f"{out_dir}/mesh_vis/iteration_{i}.png")
-                        except:
-                            print('Tried to plot mesh but could not')
 
                 # if iters_since_update >= triangulation_update_period:
                 #     model.apply_centroidal_voronoi_tessellation()
