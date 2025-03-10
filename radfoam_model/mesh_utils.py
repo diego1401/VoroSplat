@@ -13,14 +13,14 @@ from pytorch3d.renderer import (
 )
 
 from pytorch3d.renderer import look_at_view_transform
-def triangle_case1(tets, values, points, features, alpha_f):
+def triangle_case1(tets, values, points, features, alpha_f, normal=True):
     '''one vertex is marked inside (resp. outside), three are outside (resp. inside).'''
-    ins = tets[values<=0].repeat_interleave(3)
-    out = tets[values>0]
+    ins = tets[values<=0 if normal else values<0].repeat_interleave(3)
+    out = tets[values>0 if normal else values>=0]
     
     # interpolate point position
-    v_ins = values[values<=0].repeat_interleave(3)
-    v_out = values[values>0]
+    v_ins = values[values<=0 if normal else values<0].repeat_interleave(3)
+    v_out = values[values>0 if normal else values>=0]
     alpha_value = (v_out/(v_out-v_ins))[:, None]
     new_points = alpha_value*points[ins] + (1-alpha_value)*points[out]
     
@@ -92,16 +92,16 @@ def marching_tetrahedra(tets, sdf_values, points, features, alpha_f=.5):
         if (pos==i).sum()>0:
             if i==1:
                 reverse = torch.logical_or(values[:, 1]>0, values[:, 3]>0)[pos==1]
-                new_points, new_tri, new_features = triangle_case1(tets[pos==1], -values[pos==1], points, features, 1-alpha_f)
+                new_points, new_tri, new_features = triangle_case1(tets[pos==1], -values[pos==1], points, features, 1-alpha_f, False)
                 reverse_triangles(new_tri, reverse)
             if i==2:
-                f13 = torch.logical_and(values[:, 1]<0, values[:, 3]<0)
-                f02 = torch.logical_and(values[:, 0]<0, values[:, 2]<0)
+                f13 = torch.logical_and(values[:, 1]<=0, values[:, 3]<=0)
+                f02 = torch.logical_and(values[:, 0]<=0, values[:, 2]<=0)
                 reverse = torch.logical_not(f13+f02)[pos==2]
                 new_points, new_tri, new_features = triangle_case2(tets[pos==2], values[pos==2], points, features, alpha_f)
                 reverse_triangles(new_tri, reverse.repeat_interleave(2))
             if i==3:
-                reverse = torch.logical_or(values[:, 0]<0, values[:, 2]<0)[pos==3]
+                reverse = torch.logical_or(values[:, 0]<=0, values[:, 2]<=0)[pos==3]
                 new_points, new_tri, new_features = triangle_case1(tets[pos==3], (values[pos==3]), points, features, alpha_f)
                 reverse_triangles(new_tri, reverse)
             new_v.append(new_points)
