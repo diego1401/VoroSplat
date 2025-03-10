@@ -1,4 +1,7 @@
 import torch
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
 
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
@@ -104,34 +107,68 @@ def marching_tetrahedra(tets, sdf_values, points, features, alpha_f=.5):
             new_cf.append(new_features)
             new_f.append(cur_ind+new_tri)
             cur_ind += len(new_points)
-            
-            
+    return torch.cat(new_v), torch.cat(new_f), torch.cat(new_cf)
 
-def render_mesh(v,f,feat,camera_parameters):
+def colmap_to_pytorch3d(rotation,translation,device):
+    '''
+    Changes the rotation and translation from the colmap to the pytorch 3D convention.
+    '''
+    rotation = torch.stack([-rotation[:, 0], -rotation[:, 1], rotation[:, 2]], 1) # from RDF to Left-Up-Forward for Rotation
+    new_c2w = torch.cat([rotation, translation], 1)
+    bottom = torch.Tensor([[0,0,0,1]]).to(device)
+    w2c = torch.linalg.inv(torch.cat((new_c2w, bottom), 0))
+    rotation, translation = w2c[:3, :3].permute(1, 0), w2c[:3, 3]
 
-    # Device setup
+    return rotation, translation
+
+def get_camera_parameters_from_data_handler(datahandler,idx,device):
+    width, height = datahandler.img_wh
+    c2w = datahandler.c2ws[idx].to(device)
+    ground_truth_image = datahandler.train_rgbs.view(datahandler.c2ws.shape[0],height,width,3)[idx]
+    K = datahandler.K.to(device)
+    fx = K[0][0]
+    fy = K[1][1]
+    cx = K[0][2]
+    cy = K[1][2]
+
+    rotation = c2w[:3, :3]
+    translation = c2w[:3, 3:]
+
+    return ground_truth_image,rotation, translation, height, width, fx, fy, cx, cy
+
+def render_mesh(v,f,feat,datahandler,idx=0):
+    '''
+    Render the mesh given extracted vertices v and faces f. 
+    This function outputs an image
+    '''
+    # Loading the mesh
     device = v.device
-
-    # Example mesh (triangle)
     verts = v.unsqueeze(0)
     faces = f.unsqueeze(0).to(device)
-    textures = TexturesVertex(verts_features=feat.unsqueeze(0))  # White color
+    features = feat.unsqueeze(0)
 
-    # Create a Meshes object
+    textures = TexturesVertex(verts_features=features)
     mesh = Meshes(verts=verts, faces=faces, textures=textures)
 
-    # Camera setup
-    #TODO: import camera parameters
+    # Get the camera parameters
+    ground_truth_image, rotation, translation, height, width, fx, fy, cx, cy \
+        = get_camera_parameters_from_data_handler(datahandler,idx,device)
+    
+    rotation, translation = colmap_to_pytorch3d(rotation,translation,device)
 
-    R, T = look_at_view_transform(dist=distance, elev=elevation, azim=azimuth)
-
-    cameras = PerspectiveCameras(device=device, R=R, T=T)
-    # Lighting; TODO: Is this only ambient lighting ? 
-    lights = PointLights(device=device, location=[[0, 0, 0]],ambient_color=((1.0,1.0,1.0),))
+    cameras = PerspectiveCameras(device=device, 
+                                 R=rotation.unsqueeze(0).to(device), 
+                                 T=translation.unsqueeze(0).to(device),
+                                 in_ndc=False,
+                                 image_size=((height,width),),
+                                 focal_length=((fx,fy),),
+                                 principal_point=((cx,cy),))
+    
+    lights = PointLights(device=device, location=[[0.0, 0.0, 0.0]],ambient_color=((1.0,1.0,1.0),))
 
     # Rasterization settings
     raster_settings = RasterizationSettings(
-        image_size=256,
+        image_size=(height,width),
         blur_radius=0.0,
         faces_per_pixel=10
     )
@@ -146,4 +183,43 @@ def render_mesh(v,f,feat,camera_parameters):
     renderer = MeshRenderer(rasterizer=rasterizer, shader=shader)
 
     # Render the image
-    return renderer(mesh)
+    return ground_truth_image,renderer(mesh).squeeze(0)
+
+def mesh_render_plot(image,ground_truth_image,filename):
+    # Convert prediction image from RGBA to RGB
+    pred_rgb = image[..., :3].cpu().detach().squeeze(0).numpy()
+    pred_rgb = pred_rgb.clip(0, 1)  # Ensure valid range
+
+    # Ensure ground truth image is also in valid range
+    if ground_truth_image is None:
+        ground_truth_image = np.zeros_like(pred_rgb)
+    elif isinstance(ground_truth_image,torch.Tensor):
+        gt_rgb = ground_truth_image.numpy()
+    else:
+        gt_rgb = np.array(ground_truth_image, dtype=np.float32) / 255.0  # Convert to [0,1] range
+
+    if gt_rgb.shape[:2] != pred_rgb.shape[:2]:
+        gt_rgb = np.array(Image.fromarray((gt_rgb * 255).astype(np.uint8)).resize(pred_rgb.shape[1::-1])) / 255.0
+
+    # Compute the error image (absolute difference)
+    error_image = np.abs(pred_rgb - gt_rgb)
+    # Create a figure with three subplots
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    # Plot predicted image
+    axes[0].imshow(pred_rgb)
+    axes[0].set_title("Extraction")
+    axes[0].axis("off")
+
+    # Plot ground truth image
+    axes[1].imshow(gt_rgb)
+    axes[1].set_title("Ground Truth")
+    axes[1].axis("off")
+
+    # Plot error image
+    axes[2].imshow(error_image)
+    axes[2].set_title("Error Image")
+    axes[2].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(filename)

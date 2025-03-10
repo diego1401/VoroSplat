@@ -18,6 +18,7 @@ from data_loader import DataHandler
 from configs import *
 from radfoam_model.scene import RadFoamScene
 from radfoam_model.utils import psnr
+from radfoam_model.mesh_utils import render_mesh, mesh_render_plot
 import radfoam
 
 
@@ -25,6 +26,17 @@ seed = 42
 torch.random.manual_seed(seed)
 np.random.seed(seed)
 
+def nan_grad_hook(module, grad_input, grad_output):
+    for i, grad in enumerate(grad_output):
+        if grad is not None and torch.isnan(grad).any():
+            nan_indices = torch.nonzero(torch.isnan(grad), as_tuple=True)
+            print(f"NaN detected in gradients of {module.__class__.__name__} at indices: {nan_indices}")
+
+
+def nan_hook(module, input, output):
+    if torch.isnan(output).any():
+        nan_indices = torch.nonzero(torch.isnan(output), as_tuple=True)
+        print(f"NaN detected in {module.__class__.__name__} at indices: {nan_indices}")
 
 def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     device = torch.device(model_args.device)
@@ -38,6 +50,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         out_dir = f"output/{experiment_name}"
         writer = SummaryWriter(out_dir, purge_step=0)
         os.makedirs(f"{out_dir}/test", exist_ok=True)
+        os.makedirs(f"{out_dir}/mesh_vis", exist_ok=True)
 
         def represent_list_inline(dumper, data):
             return dumper.represent_sequence(
@@ -201,7 +214,42 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     2 * i / pipeline_args.iterations, 1
                 )
 
-                loss = color_loss.mean() + opacity_loss + w_depth * quant_loss
+                loss = color_loss.mean() + \
+                    opacity_loss + w_depth * quant_loss
+                # Mesh loss
+                try:
+                    v, f, feat = model.get_mesh()
+                    random_training_index = np.random.randint(0,train_data_handler.c2ws.shape[0])
+                    gt_image_mesh, rgb_mesh = render_mesh(v,f,feat,
+                                                          train_data_handler,
+                                                          idx=random_training_index)
+                    # White background
+                    mesh_opacity = rgb_mesh[..., -1:]
+                    if pipeline_args.white_background:
+                        rgb_mesh_output = rgb_mesh[..., :3] #+ (1 - mesh_opacity)
+                    else:
+                        rgb_mesh_output = rgb_mesh[..., :3]
+
+                    print(f"RGB Mesh Output Shape: {rgb_mesh_output.shape}")
+                    print(f"RGB Mesh Output: {rgb_mesh_output}")
+                    print(f"Ground Truth Image Mesh Shape: {gt_image_mesh.shape}")
+                    print(f"Ground Truth Image Mesh: {gt_image_mesh}")
+                    mesh_color_loss = rgb_loss(gt_image_mesh.cuda(),rgb_mesh_output)
+                    print('mesh color loss shape',mesh_color_loss.shape)
+                    print('mesh color loss',mesh_color_loss)
+                    print(f"Mesh color loss: {mesh_color_loss.mean().item():.5f}")
+                    print(f"Color loss min: {color_loss.min().item():.5f}, max: {color_loss.max().item():.5f}")
+                    print(f"Mesh color loss min: {mesh_color_loss.min().item():.5f}, max: {mesh_color_loss.max().item():.5f}")
+                    mesh_color_loss.register_full_backward_hook(nan_grad_hook)
+                    mesh_color_report = mesh_color_loss.mean()
+                    # loss += mesh_color_loss.mean()
+                except:
+                    primal_values = (model.get_primal_density().squeeze() - 5)
+                    print(f"Max primal value: {primal_values.max().item()}")
+                    mesh_color_report = torch.inf
+                ###############
+
+                
 
                 model.optimizer.zero_grad(set_to_none=True)
 
@@ -211,7 +259,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                 loss.backward()
                 event.synchronize()
                 ray_batch, rgb_batch = next(data_iterator)
-
+                
                 model.optimizer.step()
                 model.update_learning_rate(i)
 
@@ -219,6 +267,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 if i % 100 == 99 and not pipeline_args.debug:
                     writer.add_scalar("train/rgb_loss", color_loss.mean(), i)
+                    writer.add_scalar("train/mesh_rgb_loss", mesh_color_report, i)
                     num_points = model.primal_points.shape[0]
                     writer.add_scalar("test/num_points", num_points, i)
 
@@ -239,6 +288,20 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     writer.add_scalar(
                         "lr/attr_lr", model.attr_dc_scheduler_args(i), i
                     )
+
+                if i % 10 == 9:
+                    # Render test image example and save it
+                    with torch.no_grad():
+                        try:
+                            primal_values = (model.get_primal_density().squeeze() - 5)
+                            if primal_values.max() > 0:
+                                v, f, feat = model.get_mesh()
+                                gt_image_mesh, rgb_mesh = render_mesh(v,f,feat,
+                                                                train_data_handler,
+                                                                idx=0)
+                                mesh_render_plot(rgb_mesh,gt_image_mesh,filename=f"{out_dir}/mesh_vis/iteration_{i}.png")
+                        except:
+                            print('Tried to plot mesh but could not')
 
                 # if iters_since_update >= triangulation_update_period:
                 #     model.apply_centroidal_voronoi_tessellation()
@@ -344,4 +407,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    torch.autograd.set_detect_anomaly(True)
+    with torch.autograd.detect_anomaly():
+        main()
