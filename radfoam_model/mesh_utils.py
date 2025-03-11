@@ -13,6 +13,60 @@ from pytorch3d.renderer import (
 )
 
 from pytorch3d.renderer import look_at_view_transform
+def triangle_case1(tets, values, points, features, alpha_f, normal=True):
+    '''one vertex is marked inside (resp. outside), three are outside (resp. inside).'''
+    ins = tets[values<=0 if normal else values<0].repeat_interleave(3)
+    out = tets[values>0 if normal else values>=0]
+    
+    # interpolate point position
+    v_ins = values[values<=0 if normal else values<0].repeat_interleave(3)
+    v_out = values[values>0 if normal else values>=0]
+    alpha_value = (v_out/(v_out-v_ins))[:, None]
+    new_points = alpha_value*points[ins] + (1-alpha_value)*points[out]
+    
+    # interpolate features
+    new_features = alpha_f*features[ins] + (1-alpha_f)*features[out]
+    
+    # create triangles
+    new_tri = torch.arange(len(new_points), device=points.device).reshape(len(new_points)//3,3)
+    return new_points, new_tri, new_features
+
+def triangle_case2(tets, values, points, features, alpha_f):
+    '''two vertices are marked inside, two are marked outside'''
+    ins = tets[values<=0]
+    out = tets[values>0]
+    
+    # interpolate point position
+    v_ins = values[values<=0]
+    v_out = values[values>0]
+    
+    a1 = (v_out[::2, None]/(v_out[::2, None]-v_ins[::2, None]))
+    p1 = a1*points[ins][::2] + (1-a1)*points[out][::2]
+    
+    a2 = (v_out[1::2, None]/(v_out[1::2, None]-v_ins[1::2, None]))
+    p2 = a2*points[ins][1::2] + (1-a2)*points[out][1::2]
+    
+    a3 = (v_out[1::2, None]/(v_out[1::2, None]-v_ins[::2, None]))
+    p3 = a3*points[ins][::2] + (1-a3)*points[out][1::2]
+    
+    a4 = (v_out[::2, None]/(v_out[::2, None]-v_ins[1::2, None]))
+    p4 = a4*points[ins][1::2] + (1-a4)*points[out][::2]
+    
+    new_points = torch.cat((p1,p2,p3,p4))
+
+    # interpolate features
+    f1 = alpha_f*features[ins][::2] + (1-alpha_f)*features[out][::2]
+    f2 = alpha_f*features[ins][1::2] + (1-alpha_f)*features[out][1::2]
+    f3 = alpha_f*features[ins][::2] + (1-alpha_f)*features[out][1::2]
+    f4 = alpha_f*features[ins][1::2] + (1-alpha_f)*features[out][::2]
+    
+    new_features = torch.cat((f1,f2,f3,f4))
+    
+    # create triangles
+    ls = len(p1)
+    new_tri = torch.tensor([[0,2*ls,3*ls], [1*ls,3*ls,2*ls]], device=points.device).repeat(ls,1)
+    new_tri += torch.arange(ls, device=points.device).repeat_interleave(2)[:, None]
+    return new_points, new_tri, new_features
 
 def reverse_triangles(tri, reverse):
     tri[reverse, 0], tri[reverse, 1] = tri[reverse, 1].clone(), tri[reverse, 0].clone()
@@ -116,6 +170,13 @@ def get_camera_parameters_from_data_handler(datahandler,idx,device):
 
     return ground_truth_image,rotation, translation, height, width, fx, fy, cx, cy
 
+def nan_grad_hook_full(module, grad_input, grad_output):
+    for i, grad in enumerate(grad_output):
+        if grad is not None and torch.isnan(grad).any():
+            nan_indices = torch.nonzero(torch.isnan(grad), as_tuple=True)
+            print(f"renderer NaN detected in gradients of {module.__class__.__name__} at indices: {nan_indices}")
+            raise ValueError("Nan ground in renderer")
+
 
 def render_mesh(v,f,feat,data_handler,size=(64,64),idx=0):
     '''
@@ -129,8 +190,12 @@ def render_mesh(v,f,feat,data_handler,size=(64,64),idx=0):
     features = feat.unsqueeze(0)
 
     textures = TexturesVertex(verts_features=features)
-    mesh = Meshes(verts=verts, faces=faces, textures=textures)
 
+    if verts.requires_grad:
+        verts.register_hook(lambda g: nan_grad_hook("verts",verts,g))
+
+    mesh = Meshes(verts=verts, faces=faces, textures=textures)
+    # print('faces area',mesh.faces_areas_packed().shape,verts.shape)
     # Get the camera parameters
     # ground_truth_image, rotation, translation, height, width, fx, fy, cx, cy = get_camera_parameters(idx)
     ground_truth_image, rotation, translation, height, width, fx, fy, cx, cy = get_camera_parameters_from_data_handler(data_handler,idx,device)
@@ -151,19 +216,19 @@ def render_mesh(v,f,feat,data_handler,size=(64,64),idx=0):
     new_h,new_w = size
     raster_settings = RasterizationSettings(
         image_size=(new_h,new_w),
-        blur_radius=0.0,
-        faces_per_pixel=1
+        faces_per_pixel=10,
+        max_faces_per_bin=1e6
     )
 
     # Define rasterizer
     rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings)
 
     # Define shader (Phong shading)
-    shader = SoftPhongShader(device=device, cameras=cameras, lights=lights)
+    shader = HardPhongShader(device=device, cameras=cameras, lights=lights)
 
     # Create the MeshRenderer
     renderer = MeshRenderer(rasterizer=rasterizer, shader=shader)
-
+    
     # Render the image
     square_side = min(height,width)
     reshape_gt = torchvision.transforms.CenterCrop((square_side,square_side))(ground_truth_image.permute(2,0,1))

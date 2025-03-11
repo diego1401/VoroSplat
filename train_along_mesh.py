@@ -18,25 +18,13 @@ from data_loader import DataHandler
 from configs import *
 from radfoam_model.scene import RadFoamScene
 from radfoam_model.utils import psnr
-from radfoam_model.mesh_utils import render_mesh, mesh_render_plot
+from radfoam_model.mesh_utils import render_mesh, mesh_render_plot, nan_grad_hook
 import radfoam
 
 
 seed = 42
 torch.random.manual_seed(seed)
 np.random.seed(seed)
-
-def nan_grad_hook(module, grad_input, grad_output):
-    for i, grad in enumerate(grad_output):
-        if grad is not None and torch.isnan(grad).any():
-            nan_indices = torch.nonzero(torch.isnan(grad), as_tuple=True)
-            print(f"NaN detected in gradients of {module.__class__.__name__} at indices: {nan_indices}")
-
-
-def nan_hook(module, input, output):
-    if torch.isnan(output).any():
-        nan_indices = torch.nonzero(torch.isnan(output), as_tuple=True)
-        print(f"NaN detected in {module.__class__.__name__} at indices: {nan_indices}")
 
 def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
     device = torch.device(model_args.device)
@@ -218,14 +206,19 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     opacity_loss + w_depth * quant_loss
                 # Mesh loss
                 primal_values = (model.get_primal_density().squeeze() - 5)
-                if primal_values.max() > 0.0:
+                apply_mesh_loss = primal_values.max() > 0.0
+                if apply_mesh_loss:
                 # try:
                     v, f, feat = model.get_mesh()
                     random_training_index = np.random.randint(0,train_data_handler.c2ws.shape[0])
                     gt_image_mesh, rgb_mesh = render_mesh(v,f,feat,
                                                           train_data_handler,
-                                                          size=(512,512),
+                                                          size=(32,32),
                                                           idx=random_training_index)
+                    
+
+                    if rgb_mesh.requires_grad:
+                        rgb_mesh.register_hook(lambda g: nan_grad_hook("rgb_mesh",rgb_mesh,g))
                     # White background
                     mesh_opacity = rgb_mesh[..., -1:]
                     if pipeline_args.white_background:
@@ -233,27 +226,15 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     else:
                         rgb_mesh_output = rgb_mesh[..., :3]
 
-                    # print(f"RGB Mesh Output Shape: {rgb_mesh_output.shape}")
-                    # print(f"RGB Mesh Output: {rgb_mesh_output}")
-                    # print(f"Ground Truth Image Mesh Shape: {gt_image_mesh.shape}")
-                    # print(f"Ground Truth Image Mesh: {gt_image_mesh}")
+                    mesh_opacity_loss = ((1 - mesh_opacity) ** 2)
                     mesh_color_loss = rgb_loss(gt_image_mesh.cuda(),rgb_mesh_output)
-                    # print('mesh color loss shape',mesh_color_loss.shape)
-                    # print('mesh color loss',mesh_color_loss)
-                    # print(f"Mesh color loss: {mesh_color_loss.mean().item():.5f}")
-                    # print(f"Color loss min: {color_loss.min().item():.5f}, max: {color_loss.max().item():.5f}")
-                    # print(f"Mesh color loss min: {mesh_color_loss.min().item():.5f}, max: {mesh_color_loss.max().item():.5f}")
-                    # mesh_color_loss.register_full_backward_hook(nan_grad_hook)
+                    
                     mesh_color_report = mesh_color_loss.mean()
-                    loss += mesh_color_loss.mean()
+                    loss += mesh_color_loss.mean() + mesh_opacity_loss.mean()
                 # except:
                 else:
-                    print(f"Max primal value: {primal_values.max().item()}")
                     mesh_color_report = torch.inf
                 ###############
-
-                
-
                 model.optimizer.zero_grad(set_to_none=True)
 
                 # Hide latency of data loading behind the backward pass
@@ -301,6 +282,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                                 v, f, feat = model.get_mesh()
                                 gt_image_mesh, rgb_mesh = render_mesh(v,f,feat,
                                                                 train_data_handler,
+                                                                size=(128,128),
                                                                 idx=0)
                                 mesh_render_plot(rgb_mesh,gt_image_mesh,filename=f"{out_dir}/mesh_vis/iteration_{i}.png")
 
@@ -408,6 +390,6 @@ def main():
 
 
 if __name__ == "__main__":
-    torch.autograd.set_detect_anomaly(True)
-    with torch.autograd.detect_anomaly():
-        main()
+    # torch.autograd.set_detect_anomaly(True)
+    # with torch.autograd.detect_anomaly(check_nan=True):
+    main()
