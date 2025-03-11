@@ -13,65 +13,11 @@ from pytorch3d.renderer import (
 )
 
 from pytorch3d.renderer import look_at_view_transform
-def triangle_case1(tets, values, points, features, alpha_f, normal=True):
-    '''one vertex is marked inside (resp. outside), three are outside (resp. inside).'''
-    ins = tets[values<=0 if normal else values<0].repeat_interleave(3)
-    out = tets[values>0 if normal else values>=0]
-    
-    # interpolate point position
-    v_ins = values[values<=0 if normal else values<0].repeat_interleave(3)
-    v_out = values[values>0 if normal else values>=0]
-    alpha_value = (v_out/(v_out-v_ins))[:, None]
-    new_points = alpha_value*points[ins] + (1-alpha_value)*points[out]
-    
-    # interpolate features
-    new_features = alpha_f*features[ins] + (1-alpha_f)*features[out]
-    
-    # create triangles
-    new_tri = torch.arange(len(new_points), device=points.device).reshape(len(new_points)//3,3)
-    return new_points, new_tri, new_features
-
-def triangle_case2(tets, values, points, features, alpha_f):
-    '''two vertices are marked inside, two are marked outside'''
-    ins = tets[values<=0]
-    out = tets[values>0]
-    
-    # interpolate point position
-    v_ins = values[values<=0]
-    v_out = values[values>0]
-    
-    a1 = (v_out[::2, None]/(v_out[::2, None]-v_ins[::2, None]))
-    p1 = a1*points[ins][::2] + (1-a1)*points[out][::2]
-    
-    a2 = (v_out[1::2, None]/(v_out[1::2, None]-v_ins[1::2, None]))
-    p2 = a2*points[ins][1::2] + (1-a2)*points[out][1::2]
-    
-    a3 = (v_out[1::2, None]/(v_out[1::2, None]-v_ins[::2, None]))
-    p3 = a3*points[ins][::2] + (1-a3)*points[out][1::2]
-    
-    a4 = (v_out[::2, None]/(v_out[::2, None]-v_ins[1::2, None]))
-    p4 = a4*points[ins][1::2] + (1-a4)*points[out][::2]
-    
-    new_points = torch.cat((p1,p2,p3,p4))
-
-    # interpolate features
-    f1 = alpha_f*features[ins][::2] + (1-alpha_f)*features[out][::2]
-    f2 = alpha_f*features[ins][1::2] + (1-alpha_f)*features[out][1::2]
-    f3 = alpha_f*features[ins][::2] + (1-alpha_f)*features[out][1::2]
-    f4 = alpha_f*features[ins][1::2] + (1-alpha_f)*features[out][::2]
-    
-    new_features = torch.cat((f1,f2,f3,f4))
-    
-    # create triangles
-    ls = len(p1)
-    new_tri = torch.tensor([[0,2*ls,3*ls], [1*ls,3*ls,2*ls]], device=points.device).repeat(ls,1)
-    new_tri += torch.arange(ls, device=points.device).repeat_interleave(2)[:, None]
-    return new_points, new_tri, new_features
 
 def reverse_triangles(tri, reverse):
     tri[reverse, 0], tri[reverse, 1] = tri[reverse, 1].clone(), tri[reverse, 0].clone()
 
-def marching_tetrahedra(tets, sdf_values, points, features, alpha_f=.5):
+def marching_tetrahedra(tets, sdf_values, points, features, ret_edge = False):
     """
         marching tetrahedra of a given tet grid (in our case extracted from delaunay)
 
@@ -86,29 +32,58 @@ def marching_tetrahedra(tets, sdf_values, points, features, alpha_f=.5):
     values = sdf_values[tets]
     
     pos = (values>0).sum(1)
-    new_v, new_f, new_cf = [], [], []
-    cur_ind = 0
+    new_f = []
+    
+    # Compute triangle connectivity
     for i in [1, 2, 3]:
         if (pos==i).sum()>0:
             if i==1:
                 reverse = torch.logical_or(values[:, 1]>0, values[:, 3]>0)[pos==1]
-                new_points, new_tri, new_features = triangle_case1(tets[pos==1], -values[pos==1], points, features, 1-alpha_f, False)
+                out = tets[pos==1][values[pos==1]>0].repeat_interleave(3)
+                ins = tets[pos==1][values[pos==1]<=0]
+                new_tri = torch.column_stack((ins, out)).reshape(len(ins)//3,3,2)
                 reverse_triangles(new_tri, reverse)
             if i==2:
                 f13 = torch.logical_and(values[:, 1]<=0, values[:, 3]<=0)
                 f02 = torch.logical_and(values[:, 0]<=0, values[:, 2]<=0)
                 reverse = torch.logical_not(f13+f02)[pos==2]
-                new_points, new_tri, new_features = triangle_case2(tets[pos==2], values[pos==2], points, features, alpha_f)
+                ins = tets[pos==2][values[pos==2]<=0]
+                out = tets[pos==2][values[pos==2]>0]
+                p1 = torch.column_stack((ins[::2], out[::2]))
+                p2 = torch.column_stack((ins[1::2], out[1::2]))
+                p3 = torch.column_stack((ins[::2], out[1::2]))
+                p4 = torch.column_stack((ins[1::2], out[::2]))
+                ps = torch.cat((p1, p2, p3, p4))
+                ls = len(p1)
+                new_tri = torch.tensor([[0,2*ls,3*ls], [1*ls,3*ls,2*ls]], device=points.device).repeat(ls,1)
+                new_tri += torch.arange(ls, device=points.device).repeat_interleave(2)[:, None]
+                new_tri = ps[new_tri]
                 reverse_triangles(new_tri, reverse.repeat_interleave(2))
             if i==3:
                 reverse = torch.logical_or(values[:, 0]<=0, values[:, 2]<=0)[pos==3]
-                new_points, new_tri, new_features = triangle_case1(tets[pos==3], (values[pos==3]), points, features, alpha_f)
+                out = tets[pos==3][values[pos==3]>0]
+                ins = tets[pos==3][values[pos==3]<=0].repeat_interleave(3)
+                new_tri = torch.column_stack((ins, out)).reshape(len(ins)//3,3,2)
                 reverse_triangles(new_tri, reverse)
-            new_v.append(new_points)
-            new_cf.append(new_features)
-            new_f.append(cur_ind+new_tri)
-            cur_ind += len(new_points)
-    return torch.cat(new_v), torch.cat(new_f), torch.cat(new_cf)
+        new_f.append(new_tri)
+        
+    nt = torch.cat(new_f)
+    lv = len(sdf_values)
+    hash = lv*nt[..., 1]+nt[..., 0]
+    idx, tri_to_idx = hash.unique(return_inverse=True)
+    edge = torch.column_stack((idx%lv, idx//lv))
+
+    v_ins = sdf_values[edge[..., 0].flatten()]
+    v_out = sdf_values[edge[..., 1].flatten()]
+    alpha_value = (v_out/(v_out-v_ins))[:, None]
+    
+    new_v = points[edge[..., 0].flatten()]*alpha_value+points[edge[..., 1].flatten()]*(1-alpha_value)
+    new_cf = features[edge[..., 0].flatten()]*alpha_value+features[edge[..., 1].flatten()]*(1-alpha_value)
+    
+    if ret_edge:
+        return new_v, tri_to_idx, new_cf, edge
+    
+    return new_v, tri_to_idx, new_cf
 
 def colmap_to_pytorch3d(rotation,translation,device):
     '''
