@@ -22,12 +22,16 @@ def marching_tetrahedra(tets, sdf_values, points, features, ret_edge = False):
         marching tetrahedra of a given tet grid (in our case extracted from delaunay)
 
         Parameters:
-            tets: (N,4) tetrahedra indices
-            is_inside: (M,) boolean tensor, True if the point is inside the mesh
-            points: (M,3) tensor of vertices
-            features: (M,D) tensor of features at the vertices
-            alpha_f: float between 0 and 1, interpolation factor for features. .5 is default, 1. is inside vertices only
+            tets: (N, 4) tetrahedra indices
+            sdf_values: (M, ) sdf tensor
+            points: (M, 3) tensor of vertices
+            features: (M, D) tensor of features at the vertices
             
+        Returns:
+            vertices: (P, 3)
+            triangles: (Q, 3)
+            interpolated features: (P, D)
+            (optional) edges: (P, 2) indices of the original points/features
     """
     values = sdf_values[tets]
     
