@@ -8,7 +8,7 @@ import tqdm
 import radfoam
 from radfoam_model.render import TraceRays
 from radfoam_model.utils import *
-from radfoam_model.mesh_utils import marching_tetrahedra
+from radfoam_model.mesh_utils import marching_tetrahedra, render_mesh
 
 
 class RadFoamScene(torch.nn.Module):
@@ -506,6 +506,31 @@ class RadFoamScene(torch.nn.Module):
 
             self.densification_postfix(new_params)
             self.prune_points(prune_mask)
+
+    def collect_error_map_from_mesh(self,data_handler):
+
+        v, f, feat = self.get_mesh()
+        point_error_accum = torch.zeros_like(self.primal_points[..., 0:1])
+        
+        rgb_loss = nn.L1Loss(reduction="none")
+
+        for i in range(data_handler.c2ws.shape[0]):
+            gt_image_mesh, rgb_mesh = render_mesh(v,f,feat, data_handler,return_only_image=True,
+                                                                 size=(256,256), idx=i)
+            # White background
+            rgb_mesh_output = rgb_mesh[..., :3] #+ (1 - mesh_opacity)
+            
+            mesh_color_loss = rgb_loss(gt_image_mesh.cuda(),rgb_mesh_output)
+            mesh_color_loss.sum().backward(retain_graph=True)
+            point_error_accum += self.primal_points.grad.norm(
+                dim=-1, keepdim=True
+            ).detach()
+            torch.cuda.synchronize()
+
+            self.optimizer.zero_grad(set_to_none=True)
+            
+
+        return point_error_accum
 
     def collect_error_map(self, data_handler, white_bkg=True, downsample=2):
         rays, rgbs = data_handler.rays, data_handler.rgbs

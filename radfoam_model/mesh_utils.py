@@ -13,6 +13,9 @@ from pytorch3d.renderer import (
 )
 
 from pytorch3d.renderer import look_at_view_transform
+from pytorch3d.ops import interpolate_face_attributes
+
+
 def triangle_case1(tets, values, points, features, alpha_f, normal=True):
     '''one vertex is marked inside (resp. outside), three are outside (resp. inside).'''
     ins = tets[values<=0 if normal else values<0].repeat_interleave(3)
@@ -177,8 +180,37 @@ def nan_grad_hook_full(module, grad_input, grad_output):
             print(f"renderer NaN detected in gradients of {module.__class__.__name__} at indices: {nan_indices}")
             raise ValueError("Nan ground in renderer")
 
+def phong_normal_shading(meshes, fragments):
+    faces = meshes.faces_packed()  # (F, 3)
+    vertex_normals = meshes.verts_normals_packed()  # (V, 3)
+    faces_normals = vertex_normals[faces]
+    ones = torch.ones_like(fragments.bary_coords)
+    pixel_normals = interpolate_face_attributes(
+        fragments.pix_to_face, ones, faces_normals
+    )
+    return pixel_normals
+class MeshRendererWithDepthAndNormal(torch.nn.Module):
+    def __init__(self, rasterizer, shader):
+        super().__init__()
+        self.rasterizer = rasterizer
+        self.shader = shader
 
-def render_mesh(v,f,feat,data_handler,size=(64,64),idx=0):
+    def forward(self, meshes_world,return_only_image=False, **kwargs) -> torch.Tensor:
+        fragments = self.rasterizer(meshes_world, **kwargs)
+        images = self.shader(fragments, meshes_world, **kwargs)
+        if return_only_image:
+            return images
+        normals = phong_normal_shading(meshes_world,fragments)
+        norm = torch.norm(normals, dim=-1, keepdim=True)
+        v_normalized = normals / norm
+        return images, \
+               fragments.zbuf, \
+               v_normalized
+    
+
+
+
+def render_mesh(v,f,feat,data_handler,return_only_image=False,size=(64,64),idx=0):
     '''
     Render the mesh given extracted vertices v and faces f. 
     This function outputs an image
@@ -191,11 +223,7 @@ def render_mesh(v,f,feat,data_handler,size=(64,64),idx=0):
 
     textures = TexturesVertex(verts_features=features)
 
-    if verts.requires_grad:
-        verts.register_hook(lambda g: nan_grad_hook("verts",verts,g))
-
     mesh = Meshes(verts=verts, faces=faces, textures=textures)
-    # print('faces area',mesh.faces_areas_packed().shape,verts.shape)
     # Get the camera parameters
     # ground_truth_image, rotation, translation, height, width, fx, fy, cx, cy = get_camera_parameters(idx)
     ground_truth_image, rotation, translation, height, width, fx, fy, cx, cy = get_camera_parameters_from_data_handler(data_handler,idx,device)
@@ -216,8 +244,7 @@ def render_mesh(v,f,feat,data_handler,size=(64,64),idx=0):
     new_h,new_w = size
     raster_settings = RasterizationSettings(
         image_size=(new_h,new_w),
-        faces_per_pixel=10,
-        max_faces_per_bin=1e6
+        faces_per_pixel=10
     )
 
     # Define rasterizer
@@ -227,19 +254,39 @@ def render_mesh(v,f,feat,data_handler,size=(64,64),idx=0):
     shader = HardPhongShader(device=device, cameras=cameras, lights=lights)
 
     # Create the MeshRenderer
-    renderer = MeshRenderer(rasterizer=rasterizer, shader=shader)
+    renderer = MeshRendererWithDepthAndNormal(rasterizer=rasterizer, shader=shader)
     
     # Render the image
     square_side = min(height,width)
     reshape_gt = torchvision.transforms.CenterCrop((square_side,square_side))(ground_truth_image.permute(2,0,1))
     reshape_gt = torchvision.transforms.Resize((new_h,new_w))(reshape_gt).permute(1,2,0)
     
-    return reshape_gt,renderer(mesh)
+    
+    return reshape_gt,renderer(mesh,return_only_image=return_only_image,eps=1e-8)
 
-def mesh_render_plot(image,ground_truth_image,filename):
+def mesh_render_plot(image,depth,normal,ground_truth_image,filename):
     # Convert prediction image from RGBA to RGB
     pred_rgb = image[..., :3].cpu().detach().squeeze(0).numpy()
     pred_rgb = pred_rgb.clip(0, 1)  # Ensure valid range
+
+    # Plot depth
+    pred_depth = depth[:,:,:,:1].mean(-1,keepdim=True).cpu().detach().squeeze(0).numpy()
+
+    # Normal
+    pred_normal = normal[:,:,:,:1, :].mean(-2,keepdim=False).cpu().detach().squeeze(0).numpy()
+
+    # Normalize to range [0,1] for visualization
+    pred_normal_vis = (pred_normal + 1) / 2  
+    pred_normal_vis = np.clip(pred_normal_vis, 0, 1)  # Ensure values stay in range
+
+    # Normalize depth for visualization
+    depth_min, depth_max = pred_depth.min(), pred_depth.max()
+    if depth_max > depth_min:  # Avoid division by zero
+        pred_depth_vis = (pred_depth - depth_min) / (depth_max - depth_min)
+    else:
+        pred_depth_vis = np.zeros_like(pred_depth)
+
+    pred_depth_vis = np.clip(pred_depth_vis, 0, 1)
 
     # Ensure ground truth image is also in valid range
     if ground_truth_image is None:
@@ -254,23 +301,34 @@ def mesh_render_plot(image,ground_truth_image,filename):
 
     # Compute the error image (absolute difference)
     error_image = np.abs(pred_rgb - gt_rgb)
-    # Create a figure with three subplots
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    # Create a figure with 2 rows: (1st row: 3 images, 2nd row: depth + empty slot)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
 
-    # Plot predicted image
-    axes[0].imshow(pred_rgb)
-    axes[0].set_title("Extraction")
-    axes[0].axis("off")
+    # First row
+    axes[0, 0].imshow(pred_rgb)
+    axes[0, 0].set_title("Extraction")
+    axes[0, 0].axis("off")
 
-    # Plot ground truth image
-    axes[1].imshow(gt_rgb)
-    axes[1].set_title("Ground Truth")
-    axes[1].axis("off")
+    axes[0, 1].imshow(gt_rgb)
+    axes[0, 1].set_title("Ground Truth")
+    axes[0, 1].axis("off")
 
-    # Plot error image
-    axes[2].imshow(error_image)
-    axes[2].set_title("Error Image")
-    axes[2].axis("off")
+    axes[0, 2].imshow(error_image)
+    axes[0, 2].set_title("Error Image")
+    axes[0, 2].axis("off")
+
+    # Second row
+    axes[1, 0].imshow(pred_depth_vis, cmap="viridis")
+    axes[1, 0].set_title("Depth Map")
+    axes[1, 0].axis("off")
+
+    # Empty slot for Normal Map (to be filled later)
+    axes[1, 1].imshow(pred_normal_vis)
+    axes[1, 1].set_title("Normal Map")
+    axes[1, 1].axis("off")
+
+    # Hide the last subplot (optional)
+    axes[1, 2].axis("off")
 
     plt.tight_layout()
     plt.savefig(filename)

@@ -18,9 +18,10 @@ from data_loader import DataHandler
 from configs import *
 from radfoam_model.scene import RadFoamScene
 from radfoam_model.utils import psnr
-from radfoam_model.mesh_utils import render_mesh, mesh_render_plot, nan_grad_hook
+from radfoam_model.mesh_utils import render_mesh, mesh_render_plot
 import radfoam
 
+SIZE=800
 
 seed = 42
 torch.random.manual_seed(seed)
@@ -59,7 +60,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         )
     )
     train_data_handler = DataHandler(
-        dataset_args, rays_per_batch=1_000_000, device=device
+        dataset_args, rays_per_batch=400_000, device=device
     )
     downsample = iter2downsample[0]
     train_data_handler.reload(split="train", downsample=downsample)
@@ -204,37 +205,33 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
 
                 loss = color_loss.mean() + \
                     opacity_loss + w_depth * quant_loss
+                
                 # Mesh loss
                 primal_values = (model.get_primal_density().squeeze() - 5)
-                apply_mesh_loss = primal_values.max() > 0.0
+                apply_mesh_loss = primal_values.max() > 0.0 and i + 1 >= pipeline_args.mesh_regularization_from
                 if apply_mesh_loss:
-                # try:
                     v, f, feat = model.get_mesh()
                     random_training_index = np.random.randint(0,train_data_handler.c2ws.shape[0])
-                    gt_image_mesh, rgb_mesh = render_mesh(v,f,feat,
+                    gt_image_mesh, (rgb_mesh, depth_mesh_k_faces, normal_mesh_k_faces) = render_mesh(v,f,feat,
                                                           train_data_handler,
-                                                          size=(32,32),
+                                                          size=(SIZE,SIZE),
                                                           idx=random_training_index)
-                    
 
-                    if rgb_mesh.requires_grad:
-                        rgb_mesh.register_hook(lambda g: nan_grad_hook("rgb_mesh",rgb_mesh,g))
-                    # White background
-                    mesh_opacity = rgb_mesh[..., -1:]
-                    if pipeline_args.white_background:
-                        rgb_mesh_output = rgb_mesh[..., :3] #+ (1 - mesh_opacity)
-                    else:
-                        rgb_mesh_output = rgb_mesh[..., :3]
+                    mesh_opacity_loss = ((1 - rgb_mesh[..., -1:]) ** 2)
+                    mesh_color_loss = rgb_loss(gt_image_mesh.cuda(),rgb_mesh[..., :3])
 
-                    mesh_opacity_loss = ((1 - mesh_opacity) ** 2)
-                    mesh_color_loss = rgb_loss(gt_image_mesh.cuda(),rgb_mesh_output)
+                    # TODO: To apply depth and normal regularization we should:
+                    # - Change the radfoam training from batch to per image
+                    # - Import depth and normal estimation models to apply it to the gt image
+                    # - Make sure both the radiance and mesh branches use the same image 
+                    # depth_mesh = depth_mesh_k_faces[:,:,:,:1].mean(-1,keepdim=True)
                     
-                    mesh_color_report = mesh_color_loss.mean()
                     loss += mesh_color_loss.mean() + mesh_opacity_loss.mean()
-                # except:
+                
+                    mesh_color_report = mesh_color_loss.mean()
                 else:
                     mesh_color_report = torch.inf
-                ###############
+                    
                 model.optimizer.zero_grad(set_to_none=True)
 
                 # Hide latency of data loading behind the backward pass
@@ -280,14 +277,12 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                             primal_values = (model.get_primal_density().squeeze() - 5)
                             if primal_values.max() > 0:
                                 v, f, feat = model.get_mesh()
-                                gt_image_mesh, rgb_mesh = render_mesh(v,f,feat,
+                                gt_image_mesh, (rgb_mesh, depth_mesh, normal_mesh) = render_mesh(v,f,feat,
                                                                 train_data_handler,
-                                                                size=(128,128),
+                                                                size=(SIZE,SIZE),
                                                                 idx=0)
-                                mesh_render_plot(rgb_mesh,gt_image_mesh,filename=f"{out_dir}/mesh_vis/iteration_{i}.png")
-
-                # if iters_since_update >= triangulation_update_period:
-                #     model.apply_centroidal_voronoi_tessellation()
+                                mesh_render_plot(rgb_mesh,depth_mesh,normal_mesh,gt_image_mesh,
+                                                 filename=f"{out_dir}/mesh_vis/iteration_{i}.png")
 
                 if iters_since_update >= triangulation_update_period:
                     model.update_triangulation(incremental=True)
@@ -305,6 +300,8 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     and model.primal_points.shape[0]
                     < 0.9 * model.num_final_points
                 ):
+                    # point_error_mesh = model.collect_error_map_from_mesh(train_data_handler) #TODO: Is this a good idea ?
+
                     point_error, point_contribution = model.collect_error_map(
                         train_data_handler, pipeline_args.white_background
                     )
