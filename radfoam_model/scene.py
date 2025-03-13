@@ -8,7 +8,7 @@ import tqdm
 import radfoam
 from radfoam_model.render import TraceRays
 from radfoam_model.utils import *
-from radfoam_model.mesh_utils import marching_tetrahedra, render_mesh
+from radfoam_model.mesh_utils import marching_tetrahedra, render_mesh, compute_normal_from_depth
 
 
 class RadFoamScene(torch.nn.Module):
@@ -245,6 +245,29 @@ class RadFoamScene(torch.nn.Module):
 
             start_point = nn_inds[inverse_indices]
             return start_point.type(torch.uint32)
+
+    def get_depth(self, ray_batch):
+        depth_quantiles_random_idx = torch.ones(
+            *ray_batch.shape[:-1], 1, 
+            device=ray_batch.device) * 0.5
+
+        ray_batch = ray_batch.view(-1, ray_batch.shape[-1]).cuda()
+
+        _ , depth, _, _, _ = self.forward(
+            ray_batch, 
+            depth_quantiles=depth_quantiles_random_idx
+        )
+        return depth
+        
+    def get_depth_and_normal(self, ray_batch, K):
+        with torch.no_grad():
+            # We compute the normal as the gradient of the depth
+            h,w = ray_batch.shape[0],ray_batch.shape[1]
+            depth = self.get_depth(ray_batch).view(h,w)
+            
+            normal = compute_normal_from_depth(depth, K)
+
+            return depth.unsqueeze(-1), normal
 
     def forward(
         self,
