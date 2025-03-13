@@ -78,7 +78,7 @@ class OptimizationParams(ParamGroup):
         self.freeze_points = 18_000
         self.centroidal_voronoi_iterations = [1000,5000,10000]
         self.mesh_color_loss_weight = 0.0
-        self.mesh_depth_loss_weight = 1.0
+        self.mesh_depth_loss_weight = 0.0
         self.mesh_normal_loss_weight = 0.0
         super().__init__(parser, "Setting Optimization parameters")
 

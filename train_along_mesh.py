@@ -230,7 +230,12 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         depth_mesh = depth_mesh_k_faces[:,:,:,:1].mean(-1,keepdim=True)
                         normal_mesh = normal_mesh_k_faces[:,:,:,:1, :].mean(-2,keepdim=False)
 
-                        depth_loss = (depth_gt - depth_mesh).abs().mean()
+                        # Convert depth to disparity (inverse depth)
+                        disparity_gt = 1.0 / (depth_gt + 1e-6)  # Add small epsilon to avoid division by zero
+                        disparity_mesh = 1.0 / (depth_mesh + 1e-6)
+                        
+                        # Compute loss in disparity space
+                        depth_loss = (disparity_gt - disparity_mesh).abs().mean()
                         normal_loss = (normal_gt - normal_mesh).abs().mean()
                         
                         if optimizer_args.mesh_depth_loss_weight > 0.0:
