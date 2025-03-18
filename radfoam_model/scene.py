@@ -8,8 +8,9 @@ import tqdm
 import radfoam
 from radfoam_model.render import TraceRays
 from radfoam_model.utils import *
-from radfoam_model.mesh_utils import marching_tetrahedra, render_mesh, compute_normal_from_depth
-
+from radfoam_model.mesh_utils import marching_tetrahedra, render_mesh, compute_normal_from_depth, reshape_image
+from PIL import Image
+from transformers import pipeline
 
 class RadFoamScene(torch.nn.Module):
 
@@ -34,6 +35,7 @@ class RadFoamScene(torch.nn.Module):
         self.num_init_points = args.init_points
         self.num_final_points = args.final_points
         self.activation_scale = args.activation_scale
+        self.learn_inside_outside_labels = args.learn_inside_outside_labels
 
         if points is not None:
             self.initialize_from_pcd(points, points_colors)
@@ -56,6 +58,11 @@ class RadFoamScene(torch.nn.Module):
                 dtype=self.attr_dtype,
             )
         )
+
+        if self.learn_inside_outside_labels:
+            self.inside_outside_labels_difference = nn.Parameter(
+                torch.ones(self.num_init_points, device=device, dtype=self.attr_dtype) * 5.0
+            )
 
         self.pipeline = radfoam.create_pipeline(self.sh_degree, self.attr_dtype)
 
@@ -258,16 +265,38 @@ class RadFoamScene(torch.nn.Module):
             depth_quantiles=depth_quantiles_random_idx
         )
         return depth
+    
+    # def get_depth_and_normal_from_pretrained_model(self, image, data_handler,idx,use_lu=False):
+    #     with torch.no_grad():
+    #         # Transform image tensor to PIL image
+    #         image_numpy = image.squeeze().squeeze().detach().cpu().numpy()
+    #         image_numpy = (image_numpy * 255).astype(np.uint8)
+    #         image_pil = Image.fromarray(image_numpy)
+
+    #         # Get depth
+    #         depth_model = self.depth_pretrained_model(image_pil)['depth'] / 255
+    #         depth_model_raw = torch.from_numpy(np.array(depth_model,dtype=np.float32)).cuda()
+            
+    #         # Get normal
+    #         normal_model = compute_normal_from_depth(depth_model_raw,data_handler,idx, use_lu)
+    #         normal_model = normal_model[...,[0,2,1]]
+    #         return depth_model_raw, normal_model
         
-    def get_depth_and_normal(self, ray_batch, K):
+    def get_depth_and_normal_from_radfoam(self, ray_batch, data_handler,idx,use_lu=False):
         with torch.no_grad():
             # We compute the normal as the gradient of the depth
             h,w = ray_batch.shape[0],ray_batch.shape[1]
-            depth = self.get_depth(ray_batch).view(h,w)
+            ray_batch = reshape_image(ray_batch,h*2,w*2)
+            depth = self.get_depth(ray_batch).view(h*2,w*2)
             
-            normal = compute_normal_from_depth(depth, K)
+            normal = compute_normal_from_depth(depth, data_handler,idx,use_lu)
 
-            return depth.unsqueeze(-1), normal
+            depth = reshape_image(depth.unsqueeze(-1),h,w)
+            normal = reshape_image(normal,h,w)
+            return depth, normal
+    
+    def get_depth_and_normal(self, ray_batch, image,data_handler,idx,use_lu=False):
+        return self.get_depth_and_normal_from_radfoam(ray_batch, data_handler,idx,use_lu)
 
     def forward(
         self,
@@ -332,6 +361,13 @@ class RadFoamScene(torch.nn.Module):
             },
         ]
 
+        if self.learn_inside_outside_labels:
+            params.append({
+                "params": self.inside_outside_labels_difference,
+                "lr": args.inside_outside_labels_lr_init,
+                "name": "inside_outside_labels_difference",
+            })
+
         self.optimizer = torch.optim.Adam(params, eps=1e-15)
         self.xyz_scheduler_args = get_cosine_lr_func(
             lr_init=args.points_lr_init,
@@ -355,6 +391,11 @@ class RadFoamScene(torch.nn.Module):
             warmup_steps=max_iterations // 5,
             max_steps=max_iterations,
         )
+        self.inside_outside_labels_difference_scheduler_args = get_cosine_lr_func(
+            lr_init=args.inside_outside_labels_lr_init,
+            lr_final=args.inside_outside_labels_lr_final,
+            max_steps=max_iterations,
+        )
 
     def update_learning_rate(self, iteration):
         """Learning rate scheduling per step"""
@@ -371,6 +412,9 @@ class RadFoamScene(torch.nn.Module):
                 param_group["lr"] = lr
             elif param_group["name"] == "att_sh":
                 lr = self.attr_rest_scheduler_args(iteration)
+                param_group["lr"] = lr
+            elif param_group["name"] == "inside_outside_labels_difference":
+                lr = self.inside_outside_labels_difference_scheduler_args(iteration)
                 param_group["lr"] = lr
 
     def prune_optimizer(self, mask):
@@ -402,6 +446,8 @@ class RadFoamScene(torch.nn.Module):
         self.att_dc = optimizable_tensors["att_dc"]
         self.att_sh = optimizable_tensors["att_sh"]
         self.density = optimizable_tensors["density"]
+        if self.learn_inside_outside_labels:
+            self.inside_outside_labels_difference = optimizable_tensors["inside_outside_labels_difference"]
 
     def cat_tensors_to_optimizer(self, new_params):
         optimizable_tensors = {}
@@ -454,6 +500,8 @@ class RadFoamScene(torch.nn.Module):
         self.att_dc = optimizable_tensors["att_dc"]
         self.att_sh = optimizable_tensors["att_sh"]
         self.density = optimizable_tensors["density"]
+        if self.learn_inside_outside_labels:
+            self.inside_outside_labels_difference = optimizable_tensors["inside_outside_labels_difference"]
 
     def prune_and_densify(
         self, point_error, point_contribution, upsample_factor=1.2
@@ -513,8 +561,10 @@ class RadFoamScene(torch.nn.Module):
                 "primal_points": sampled_points,
                 "att_dc": self.att_dc[sampled_inds],
                 "att_sh": self.att_sh[sampled_inds],
-                "density": self.density[sampled_inds],
+                "density": self.density[sampled_inds]
             }
+            if self.learn_inside_outside_labels:
+                new_params["inside_outside_labels_difference"] = self.inside_outside_labels_difference[sampled_inds]
 
             prune_mask = torch.cat(
                 (
@@ -716,8 +766,15 @@ class RadFoamScene(torch.nn.Module):
 
         self.aabb_tree = radfoam.build_aabb_tree(self.primal_points)
 
+    def get_primal_values(self):
+        if self.learn_inside_outside_labels:
+            # Train inside-outside labels while not updating primal density
+            return self.get_primal_density().squeeze().detach() - torch.relu(self.inside_outside_labels_difference)
+        else:
+            return self.get_primal_density().squeeze() - 5
+
     def get_mesh(self):
-        primal_values = (self.get_primal_density().squeeze() - 5)
+        primal_values = self.get_primal_values()
         ## Get the colors
         color_attributes = self.get_primal_attributes()
 

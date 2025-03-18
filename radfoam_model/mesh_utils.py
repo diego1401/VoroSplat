@@ -4,6 +4,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import torchvision
 
+
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
     MeshRenderer, MeshRasterizer, RasterizationSettings,
@@ -189,7 +190,9 @@ def phong_normal_shading(meshes, fragments):
     pixel_normals = interpolate_face_attributes(
         fragments.pix_to_face, ones, faces_normals
     )
+
     return pixel_normals
+
 class MeshRendererWithDepthAndNormal(torch.nn.Module):
     def __init__(self, rasterizer, shader):
         super().__init__()
@@ -201,14 +204,18 @@ class MeshRendererWithDepthAndNormal(torch.nn.Module):
         images = self.shader(fragments, meshes_world, **kwargs)
         if return_only_image:
             return images
+        
         normals = phong_normal_shading(meshes_world,fragments)
         norm = torch.norm(normals, dim=-1, keepdim=True)
         v_normalized = normals / norm
-        return images, \
-               fragments.zbuf, \
-               v_normalized
+        # v_normalized = v_normalized[:,:,:,:,[1,0,2]]
+        invalid_mask = ~torch.isfinite(v_normalized).all(dim=-1)
+        v_normalized[invalid_mask] = torch.tensor([0., 0., 1.], device=v_normalized.device)
+        
+        return images.squeeze(0), \
+               fragments.zbuf.squeeze(0), \
+               v_normalized.squeeze(0).squeeze(-2)
     
-
 def reshape_image(image, new_h, new_w):
     """
     Reshapes a ground truth image to a new size while maintaining aspect ratio.
@@ -221,13 +228,14 @@ def reshape_image(image, new_h, new_w):
     Returns:
         torch.Tensor: Reshaped image tensor of shape (new_h, new_w, C)
     """
-    height, width = image.shape[:2]
-    square_side = min(height, width)
-    reshape_gt = torchvision.transforms.CenterCrop((square_side, square_side))(image.permute(2, 0, 1))
-    reshape_gt = torchvision.transforms.Resize((new_h, new_w))(reshape_gt).permute(1, 2, 0)
+    if isinstance(image, np.ndarray):
+        image = torch.from_numpy(image)
+    if image.ndim == 2:
+        image = image.unsqueeze(-1)
+    reshape_gt = torchvision.transforms.Resize((new_h, new_w))(image.permute(2, 0, 1)).permute(1, 2, 0)
     return reshape_gt
 
-def render_mesh(v,f,feat,data_handler,return_only_image=False,size=(64,64),idx=0):
+def render_mesh(v,f,feat,data_handler,return_only_image=False,downsample=4,idx=0, use_depth_anything=False):
     '''
     Render the mesh given extracted vertices v and faces f. 
     This function outputs an image
@@ -243,7 +251,9 @@ def render_mesh(v,f,feat,data_handler,return_only_image=False,size=(64,64),idx=0
     mesh = Meshes(verts=verts, faces=faces, textures=textures)
     # Get the camera parameters
     # ground_truth_image, rotation, translation, height, width, fx, fy, cx, cy = get_camera_parameters(idx)
-    ground_truth_image, ray_batch_idx, rotation, translation, height, width, fx, fy, cx, cy = get_camera_parameters_from_data_handler(data_handler,idx,device)
+    ground_truth_image, ray_batch_idx, \
+        rotation, translation, \
+            height, width, fx, fy, cx, cy = get_camera_parameters_from_data_handler(data_handler,idx,device)
     rotation, translation = colmap_to_pytorch3d(rotation,translation,device)
 
     cameras = PerspectiveCameras(device=device, 
@@ -257,18 +267,20 @@ def render_mesh(v,f,feat,data_handler,return_only_image=False,size=(64,64),idx=0
     lights = PointLights(device=device, location=[[0.0, 0.0, 0.0]],ambient_color=((1.0,1.0,1.0),))
 
     # Rasterization settings
-    
-    new_h,new_w = size
+    height, width = ground_truth_image.shape[:2]
+    new_h,new_w = height//downsample, width//downsample
+
     raster_settings = RasterizationSettings(
         image_size=(new_h,new_w),
-        faces_per_pixel=10
+        faces_per_pixel=1,
+        blur_radius=0,
     )
 
     # Define rasterizer
     rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings)
 
     # Define shader (Phong shading)
-    shader = HardPhongShader(device=device, cameras=cameras, lights=lights)
+    shader = SoftPhongShader(device=device, cameras=cameras, lights=lights)
 
     # Create the MeshRenderer
     renderer = MeshRendererWithDepthAndNormal(rasterizer=rasterizer, shader=shader)
@@ -276,58 +288,83 @@ def render_mesh(v,f,feat,data_handler,return_only_image=False,size=(64,64),idx=0
     # Reshape ground truth image
     reshape_gt = reshape_image(ground_truth_image, new_h, new_w)
     reshape_ray_batch_idx = reshape_image(ray_batch_idx, new_h, new_w)
+    if use_depth_anything:
+        depth_model = data_handler.depth_maps[idx]
+        normal_model = data_handler.normal_maps[idx]
+        depth_model = reshape_image(depth_model, new_h, new_w)
+        normal_model = reshape_image(normal_model, new_h, new_w)
+    else:
+        depth_model = None
+        normal_model = None
+    return (reshape_gt, reshape_ray_batch_idx, depth_model, normal_model), renderer(mesh,return_only_image=return_only_image,eps=1e-8)
+
+def mesh_render_plot(image, depth, normal, ground_truth_image, depth_radfoam, normal_radfoam_vis, filename):
+    def convert_to_numpy(tensor, squeeze_dims=None):
+        if isinstance(tensor, torch.Tensor):
+            tensor = tensor.cpu().detach().numpy()
+            if squeeze_dims:
+                tensor = tensor.squeeze(*squeeze_dims)
+        return tensor
+
+    def normalize_for_visualization(data, min_val=None, max_val=None):
+        if min_val is None or max_val is None:
+            min_val, max_val = data.min(), data.max()
+        if max_val > min_val:
+            return (data - min_val) / (max_val - min_val)
+        return np.zeros_like(data)
+
+    def clip_to_valid_range(data):
+        return np.clip(data, 0, 1)
+
+    # Convert tensors to numpy arrays
+    pred_rgb = convert_to_numpy(image[..., :3])
+    if depth.ndim == 4:
+        pred_depth = convert_to_numpy(depth[:, :, :, :1].mean(-1, keepdim=True), squeeze_dims=(0,))
+    else:
+        pred_depth = convert_to_numpy(depth)
     
-    return (reshape_gt, reshape_ray_batch_idx), renderer(mesh,return_only_image=return_only_image,eps=1e-8)
+    if normal.ndim == 4:
+        pred_normal = convert_to_numpy(normal[:, :, :, :1, :].mean(-2, keepdim=False), squeeze_dims=(0,))
+    else:
+        pred_normal = convert_to_numpy(normal)
+    pred_normal_vis = (pred_normal + 1) / 2
 
-def mesh_render_plot(image,depth,normal,ground_truth_image,depth_radfoam_vis,normal_radfoam_vis,filename):
-    # Convert prediction image from RGBA to RGB
-    pred_rgb = image[..., :3].cpu().detach().squeeze(0).numpy()
-    pred_rgb = pred_rgb.clip(0, 1)  # Ensure valid range
-
-    # Plot depth
-    pred_depth = depth[:,:,:,:1].mean(-1,keepdim=True).cpu().detach().squeeze(0).numpy()
-
-    # Normal
-    pred_normal = normal[:,:,:,:1, :].mean(-2,keepdim=False).cpu().detach().squeeze(0).numpy()
-
-    # Normalize to range [0,1] for visualization
-    pred_normal_vis = (pred_normal + 1) / 2  
-    pred_normal_vis = np.clip(pred_normal_vis, 0, 1)  # Ensure values stay in range
-
-    # Normalize normal for visualization
-    radfoam_normal_vis = normal_radfoam_vis.cpu().detach().squeeze(0).numpy()
+    radfoam_normal_vis = convert_to_numpy(normal_radfoam_vis)
     radfoam_normal_vis = (radfoam_normal_vis + 1) / 2
-    radfoam_normal_vis = np.clip(radfoam_normal_vis, 0, 1)
+
+    depth_radfoam_vis = convert_to_numpy(depth_radfoam)
+    depth_radfoam_vis = normalize_for_visualization(depth_radfoam_vis)
 
     # Normalize depth for visualization
-    depth_min, depth_max = pred_depth.min(), pred_depth.max()
-    if depth_max > depth_min:  # Avoid division by zero
-        pred_depth_vis = (pred_depth - depth_min) / (depth_max - depth_min)
-    else:
-        pred_depth_vis = np.zeros_like(pred_depth)
+    pred_depth_vis = normalize_for_visualization(pred_depth)
 
-    pred_depth_vis = np.clip(pred_depth_vis, 0, 1)
-
-    # Normalize depth_radfoam_vis for visualization so that values are between 0 and 1
-    depth_radfoam_vis = depth_radfoam_vis.cpu().detach().squeeze(0).numpy()
-    depth_radfoam_vis = (depth_radfoam_vis - depth_radfoam_vis.min()) / (depth_radfoam_vis.max() - depth_radfoam_vis.min())
-    depth_radfoam_vis = np.clip(depth_radfoam_vis, 0, 1)
-
-    # Ensure ground truth image is also in valid range
+    # Ensure ground truth image is in valid range
     if ground_truth_image is None:
-        ground_truth_image = np.zeros_like(pred_rgb)
-    elif isinstance(ground_truth_image,torch.Tensor):
-        gt_rgb = ground_truth_image.numpy()
+        gt_rgb = np.zeros_like(pred_rgb)
     else:
-        gt_rgb = np.array(ground_truth_image, dtype=np.float32) / 255.0  # Convert to [0,1] range
+        gt_rgb = convert_to_numpy(ground_truth_image)# / 255.0
+        if gt_rgb.shape[:2] != pred_rgb.shape[:2]:
+            gt_rgb = np.array(Image.fromarray((gt_rgb * 255).astype(np.uint8)).resize(pred_rgb.shape[1::-1])) / 255.0
 
-    if gt_rgb.shape[:2] != pred_rgb.shape[:2]:
-        gt_rgb = np.array(Image.fromarray((gt_rgb * 255).astype(np.uint8)).resize(pred_rgb.shape[1::-1])) / 255.0
+    # Clip values to valid range
+    pred_rgb = clip_to_valid_range(pred_rgb)
+    gt_rgb = clip_to_valid_range(gt_rgb)
+    pred_normal_vis = clip_to_valid_range(pred_normal_vis)
+    radfoam_normal_vis = clip_to_valid_range(radfoam_normal_vis)
+    pred_depth_vis = clip_to_valid_range(pred_depth_vis)
+    depth_radfoam_vis = clip_to_valid_range(depth_radfoam_vis)
+
+    # Compute error maps
+    rgb_error = np.abs(pred_rgb - gt_rgb).mean(axis=-1)
+    depth_error = np.abs(pred_depth_vis.squeeze() - depth_radfoam_vis.squeeze())
+    dot_product = np.sum(pred_normal_vis * radfoam_normal_vis, axis=-1)
+    dot_product = np.clip(dot_product, -1.0, 1.0)
+    normal_error = 1.0 - dot_product
 
     # Create a figure with 3 rows: RGB, Depth, and Normal comparisons
-    fig, axes = plt.subplots(3, 2, figsize=(12, 18))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 18))
 
-    # RGB comparison
+    # RGB comparison and error
     axes[0, 0].imshow(pred_rgb)
     axes[0, 0].set_title("Predicted RGB")
     axes[0, 0].axis("off")
@@ -336,7 +373,11 @@ def mesh_render_plot(image,depth,normal,ground_truth_image,depth_radfoam_vis,nor
     axes[0, 1].set_title("Ground Truth RGB")
     axes[0, 1].axis("off")
 
-    # Depth comparison
+    axes[0, 2].imshow(rgb_error, cmap='hot')
+    axes[0, 2].set_title("RGB Error")
+    axes[0, 2].axis("off")
+
+    # Depth comparison and error
     axes[1, 0].imshow(pred_depth_vis, cmap="viridis")
     axes[1, 0].set_title("Predicted Depth")
     axes[1, 0].axis("off")
@@ -345,7 +386,11 @@ def mesh_render_plot(image,depth,normal,ground_truth_image,depth_radfoam_vis,nor
     axes[1, 1].set_title("Ground Truth Depth")
     axes[1, 1].axis("off")
 
-    # Normal comparison
+    axes[1, 2].imshow(depth_error, cmap='hot')
+    axes[1, 2].set_title("Depth Error")
+    axes[1, 2].axis("off")
+
+    # Normal comparison and error
     axes[2, 0].imshow(pred_normal_vis)
     axes[2, 0].set_title("Predicted Normal")
     axes[2, 0].axis("off")
@@ -354,21 +399,61 @@ def mesh_render_plot(image,depth,normal,ground_truth_image,depth_radfoam_vis,nor
     axes[2, 1].set_title("Ground Truth Normal")
     axes[2, 1].axis("off")
 
-    plt.tight_layout()
-    plt.savefig(filename)
+    axes[2, 2].imshow(normal_error, cmap='hot')
+    axes[2, 2].set_title("Normal Error")
+    axes[2, 2].axis("off")
 
-def compute_normal_from_depth(depth, K):
+    plt.tight_layout()
+    if filename is None:
+        plt.show()
+    else:
+        plt.savefig(filename)
+
+def depths_to_points(data_handler, depthmap, idx):
+    c2w = (data_handler.c2ws[idx].T)#.inverse()
+    W, H = data_handler.img_wh
+    ndc2pix = torch.tensor([
+        [W / 2, 0, 0, (W) / 2],
+        [0, H / 2, 0, (H) / 2],
+        [0, 0, 0, 1]]).float().cuda().T
+    projection_matrix = c2w.T @ view.full_proj_transform
+    intrins = (projection_matrix @ ndc2pix)[:3,:3].T
+    
+    grid_x, grid_y = torch.meshgrid(torch.arange(W, device='cuda').float(), torch.arange(H, device='cuda').float(), indexing='xy')
+    points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(-1, 3)
+    rays_d = points @ intrins.inverse().T @ c2w[:3,:3].T
+    rays_o = c2w[:3,3]
+    points = depthmap.reshape(-1, 1) * rays_d + rays_o
+    return points
+
+def depth_to_normal(data_handler, depth, idx):
+    """
+        view: view camera
+        depth: depthmap 
+    """
+    points = depths_to_points(data_handler, depth, idx).reshape(*depth.shape[1:], 3)
+    output = torch.zeros_like(points)
+    dx = torch.cat([points[2:, 1:-1] - points[:-2, 1:-1]], dim=0)
+    dy = torch.cat([points[1:-1, 2:] - points[1:-1, :-2]], dim=1)
+    normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
+    output[1:-1, 1:-1, :] = normal_map
+    return output
+
+
+def compute_normal_from_depth(depth, data_handler,idx,use_lu=False):
     """
     Compute surface normals from a depth map using PyTorch operations.
     
     Args:
         depth (torch.Tensor): Depth map tensor of shape (H, W)
-        K (torch.Tensor): Camera intrinsics matrix
+        data_handler: Data handler object containing camera parameters
+        idx (int): Index of the camera pose to use
         
     Returns:
-        torch.Tensor: Normal map tensor of shape (H, W, 3)
+        torch.Tensor: Normal map tensor of shape (H, W, 3) in world coordinates
     """
     # Compute gradients in x and y directions
+    K = data_handler.K
     fx = K[0][0]
     fy = K[1][1]
 
@@ -382,8 +467,20 @@ def compute_normal_from_depth(depth, K):
     # cross-product (1,0,dz_dx)X(0,1,dz_dy) = (-dz_dx, -dz_dy, 1)
     normal_cross = torch.stack([-dz_dx, -dz_dy, torch.ones_like(depth)], dim=-1)
 
+    # Transform normal from image space to world space using the data_handler
+    c2w = data_handler.c2ws[idx].cuda()[:3,:3].T
+
+    if use_lu:
+        raise NotImplementedError("LU decomposition is not implemented")
+        lu = c2w.lu()
+        normal_cross = normal_cross.view(-1,3).T.lu_solve(*lu)
+        normal_cross = normal_cross.T.view(*depth.shape[:],3)
+    else:
+        normal_cross = normal_cross @ c2w
+
     # normalize to unit vector
     normal_unit = normal_cross / torch.norm(normal_cross, dim=-1, keepdim=True)
+
     # set default normal to [0, 0, 1] for invalid values
     invalid_mask = ~torch.isfinite(normal_unit).all(dim=-1)
     normal_unit[invalid_mask] = torch.tensor([0., 0., 1.], device=depth.device)

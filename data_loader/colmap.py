@@ -32,7 +32,9 @@ class COLMAPDataset(Dataset):
         self.points3D_color = (
             torch.tensor(manager.point3D_colors, dtype=torch.float) / 255.0
         )
-
+        self.point3D_id_to_images = manager.point3D_id_to_images
+        # self.point3D_ids = manager.point3D_ids
+        self.point3D_id_to_point3D_idx = manager.point3D_id_to_point3D_idx
         # Assume shared intrinsics between all cameras.
         cam = manager.cameras[1]
         fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
@@ -59,6 +61,7 @@ class COLMAPDataset(Dataset):
         # Image names from COLMAP. No need for permuting the poses according to
         # image names anymore.
         image_names = [imdata[k].name for k in imdata]
+        self.idx_map = np.arange(len(image_names))
 
         # Get distortion parameters.
         type_ = cam.camera_type
@@ -79,6 +82,7 @@ class COLMAPDataset(Dataset):
         inds = np.argsort(image_names)
         image_names = [image_names[i] for i in inds]
         c2w = c2w_mats[inds]
+        self.idx_map = self.idx_map[inds]
 
         # Load images.
         if downsample > 1:
@@ -118,6 +122,7 @@ class COLMAPDataset(Dataset):
         }
         indices = split_indices[split]
         c2w = c2w[indices]
+        self.idx_map = self.idx_map[indices]
         self.image_paths = [self.image_paths[i] for i in indices]
 
         self.poses = []

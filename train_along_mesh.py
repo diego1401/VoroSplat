@@ -21,6 +21,7 @@ from radfoam_model.utils import psnr
 from radfoam_model.mesh_utils import render_mesh, mesh_render_plot
 import radfoam
 
+
 SIZE=256
 
 seed = 42
@@ -60,10 +61,10 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         )
     )
     train_data_handler = DataHandler(
-        dataset_args, rays_per_batch=700_000, device=device
+        dataset_args, rays_per_batch=500_000, device=device
     )
     downsample = iter2downsample[0]
-    train_data_handler.reload(split="train", downsample=downsample)
+    train_data_handler.reload(split="train", downsample=downsample, use_depth_anything=dataset_args.use_depth_anything)
 
     test_data_handler = DataHandler(
         dataset_args, rays_per_batch=0, device=device
@@ -160,6 +161,7 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
         iters_since_update = 1
         iters_since_densification = 0
         next_densification_after = 1
+        downsample_rasterization=2
 
         with tqdm.trange(pipeline_args.iterations) as train:
             for i in train:
@@ -206,42 +208,73 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                     opacity_loss + w_depth * quant_loss
                 
                 # Mesh loss
-                primal_values = (model.get_primal_density().squeeze() - 5)
-                apply_mesh_loss = primal_values.max() > 0.0 and i + 1 >= pipeline_args.mesh_regularization_from
+                primal_values_check = model.get_primal_values().max()
+                apply_mesh_loss = primal_values_check > 0.0 and i + 1 >= pipeline_args.mesh_regularization_from
                 if apply_mesh_loss:
                     mesh_loss = 0.0
-                    v, f, feat = model.get_mesh()
+                    if model.learn_inside_outside_labels:
+                        # If we learn inside-outside labels we do not update radfoam 
+                        with torch.no_grad():
+                            v, f, feat = model.get_mesh()
+                    else:
+                        v, f, feat = model.get_mesh()
+
                     random_training_index = np.random.randint(0,train_data_handler.c2ws.shape[0])
-                    (gt_image_mesh,ray_batch_random_idx), (rgb_mesh, depth_mesh_k_faces, normal_mesh_k_faces) = render_mesh(v,f,feat,
+                    pckg, (rgb_mesh, depth_raster, normal_raster) = render_mesh(v,f,feat,
                                                           train_data_handler,
-                                                          size=(SIZE,SIZE),
-                                                          idx=random_training_index)
+                                                          downsample=downsample_rasterization,
+                                                          idx=random_training_index,
+                                                          use_depth_anything=dataset_args.use_depth_anything)
+
+                    (gt_image, ray_batch_random_idx, depth_pretrained_model, normal_pretrained_model) = pckg
+
+                    gt_image = gt_image.cuda()
+                    ray_batch_random_idx = ray_batch_random_idx.cuda()
 
                     if optimizer_args.mesh_color_loss_weight > 0.0:
                         mesh_opacity_loss = ((1 - rgb_mesh[..., -1:]) ** 2)
-                        mesh_color_loss = rgb_loss(gt_image_mesh.cuda(),rgb_mesh[..., :3])
+                        mesh_color_loss = rgb_loss(gt_image,rgb_mesh[..., :3])
 
                         mesh_loss += optimizer_args.mesh_color_loss_weight * \
                             (mesh_color_loss.mean() + mesh_opacity_loss.mean())
                     
                     if optimizer_args.mesh_depth_loss_weight > 0.0 or optimizer_args.mesh_normal_loss_weight > 0.0:
-                        depth_gt,normal_gt = model.get_depth_and_normal(ray_batch_random_idx.cuda(),train_data_handler.K)
+                        depth_radfoam, normal_radfoam = model.get_depth_and_normal(ray_batch_random_idx,gt_image,
+                                                                        train_data_handler,random_training_index)
                         
-                        depth_mesh = depth_mesh_k_faces[:,:,:,:1].mean(-1,keepdim=True)
-                        normal_mesh = normal_mesh_k_faces[:,:,:,:1, :].mean(-2,keepdim=False)
+                        # Depth in disparity space
+                        d_radfoam = 1 / (depth_radfoam + optimizer_args.delta_disparity)
+                        d_raster = 1 / (depth_raster + optimizer_args.delta_disparity)
+                        
+                        if dataset_args.use_depth_anything:
+                            d_gt = 1 / (depth_pretrained_model + optimizer_args.delta_disparity).cuda()
+                            normal_pretrained_model = normal_pretrained_model.cuda()
 
-                        # Convert depth to disparity (inverse depth)
-                        disparity_gt = 1.0 / (depth_gt + 1e-6)  # Add small epsilon to avoid division by zero
-                        disparity_mesh = 1.0 / (depth_mesh + 1e-6)
+                            disparity_loss_mesh = (d_raster - d_gt).abs().mean()
+                            disparity_loss_radfoam = (d_radfoam - d_gt).abs().mean()
+                            depth_loss = disparity_loss_mesh + disparity_loss_radfoam
+
+                            # Normal loss
+                            normal_loss_raster = (1 - torch.sum(normal_raster * normal_pretrained_model, dim=-1)).mean()
+                            normal_loss_radfoam = (1 - torch.sum(normal_radfoam * normal_pretrained_model, dim=-1)).mean()
+                            normal_loss = normal_loss_raster + normal_loss_radfoam
                         
-                        # Compute loss in disparity space
-                        depth_loss = (disparity_gt - disparity_mesh).abs().mean()
-                        normal_loss = (normal_gt - normal_mesh).abs().mean()
+                        else:
+                            depth_loss = (d_raster - d_radfoam.detach()).abs().mean()
+                            normal_loss = (1 - torch.sum(normal_raster * normal_radfoam.detach(), dim=-1)).mean()
+
+                        # Ref-nerf "back-facing" loss
+                        # r_d = ray_batch_random_idx[...,3:]
+                        # back_facing_loss_mesh = torch.square(torch.sum(r_d * normal_mesh, dim=-1).clamp(min=0)).mean()
+                        # back_facing_loss_radfoam = torch.square(torch.sum(r_d * normal_radfoam, dim=-1).clamp(min=0)).mean()
+                        # back_facing_loss = back_facing_loss_mesh + back_facing_loss_radfoam
                         
                         if optimizer_args.mesh_depth_loss_weight > 0.0:
                             mesh_loss += optimizer_args.mesh_depth_loss_weight * depth_loss
                         if optimizer_args.mesh_normal_loss_weight > 0.0:
+                            # Using the same weight as in Ref-NeRF
                             mesh_loss += optimizer_args.mesh_normal_loss_weight * normal_loss
+                            # mesh_loss += back_facing_loss 
 
                     loss += mesh_loss
                 
@@ -287,21 +320,31 @@ def train(args, pipeline_args, model_args, optimizer_args, dataset_args):
                         "lr/attr_lr", model.attr_dc_scheduler_args(i), i
                     )
 
-                if i % 10 == 9:
+                if i % 100 == 99:
                     # Render test image example and save it
                     with torch.no_grad():
-                        if primal_values.max() > 0.0:
-                            primal_values = (model.get_primal_density().squeeze() - 5)
-                            if primal_values.max() > 0:
-                                v, f, feat = model.get_mesh()
-                                (gt_image_mesh, ray_batch_raster ), (rgb_mesh, depth_mesh, normal_mesh) = render_mesh(v,f,feat,
-                                                                train_data_handler,
-                                                                size=(SIZE,SIZE),
-                                                                idx=0)
-                                depth_radfoam_vis, normal_radfoam_vis = model.get_depth_and_normal(ray_batch_raster.cuda(),train_data_handler.K)
-                                depth_radfoam_vis = depth_radfoam_vis.view(SIZE,SIZE)
-                                mesh_render_plot(rgb_mesh,depth_mesh,normal_mesh,gt_image_mesh, depth_radfoam_vis, normal_radfoam_vis,
-                                                 filename=f"{out_dir}/mesh_vis/iteration_{i}.png")
+                        if primal_values_check > 0:
+                            v, f, feat = model.get_mesh()
+                            pckg, (rgb_raster, depth_raster, normal_raster) = render_mesh(v,f,feat,
+                                                            train_data_handler,
+                                                            downsample=2,
+                                                            idx=0,
+                                                            use_depth_anything=dataset_args.use_depth_anything)
+                            (gt_image, ray_batch_random_idx, depth_pretrained_model, normal_pretrained_model) = pckg
+                            if dataset_args.use_depth_anything:
+                                mesh_render_plot(rgb_raster,depth_raster,normal_raster,
+                                             gt_image, depth_pretrained_model, normal_pretrained_model,
+                                                filename=f"{out_dir}/mesh_vis/iteration_{i}.png")
+                            else:
+                                depth_radfoam_vis, normal_radfoam_vis = model.get_depth_and_normal(ray_batch_random_idx.cuda(), 
+                                                                                               gt_image.cuda(), 
+                                                                                               train_data_handler,
+                                                                                               0)
+                                mesh_render_plot(rgb_raster,depth_raster,normal_raster,
+                                             gt_image, depth_radfoam_vis, normal_radfoam_vis,
+                                                filename=f"{out_dir}/mesh_vis/iteration_{i}.png")
+                            
+                            
 
                 if iters_since_update >= triangulation_update_period:
                     model.update_triangulation(incremental=True)

@@ -62,6 +62,7 @@ class ModelParams(ParamGroup):
         self.final_points = 2_097_152
         self.activation_scale = 1.0
         self.device = "cuda"
+        self.learn_inside_outside_labels = False
         super().__init__(parser, "Setting Model parameters")
 
 
@@ -74,12 +75,15 @@ class OptimizationParams(ParamGroup):
         self.density_lr_final = 1e-2
         self.attributes_lr_init = 5e-3
         self.attributes_lr_final = 5e-4
+        self.inside_outside_labels_lr_init = 1e-1
+        self.inside_outside_labels_lr_final = 1e-2
         self.sh_factor = 0.1
         self.freeze_points = 18_000
         self.centroidal_voronoi_iterations = [1000,5000,10000]
         self.mesh_color_loss_weight = 0.0
         self.mesh_depth_loss_weight = 0.0
         self.mesh_normal_loss_weight = 0.0
+        self.delta_disparity = 1e-6
         super().__init__(parser, "Setting Optimization parameters")
 
 
@@ -92,4 +96,5 @@ class DatasetParams(ParamGroup):
         self.patch_based = False
         self.downsample = [4, 2, 1]
         self.downsample_iterations = [0, 150, 500]
+        self.use_depth_anything = False
         super().__init__(parser, "Setting Dataset parameters")
